@@ -6,6 +6,7 @@
  *  1. 列表只渲染占位格子，缩略图进入视口才加载、离开视口就卸载；缩略图在本机生成一次后存 IndexedDB。
  *  2. 背景上屏前先按当前屏幕尺寸缩放裁切（默认长边 2048），显存占用只有原图的几分之一到几十分之一。
  *  3. 上传 / 删除 / 重命名走酒馆原生接口，列表增量更新，不整体重绘。
+ *     列表接口 /api/backgrounds/all 在酒馆 1.13.1 从数组改成了 { images, config }，1.16 起 images 里还带 isAnimated；三种格式都认。
  *  4. 原生面板与原生背景层通过 CSS 关闭贴图加载；关掉扩展开关即可恢复原生。
  *
  * 依赖：SillyTavern 1.12+（使用 SillyTavern.getContext()）。
@@ -38,6 +39,7 @@ const DEFAULTS = Object.freeze({
 
 const state = {
     names: [],
+    animated: new Set(),    // 服务端标记为动图的文件名（酒馆 1.16+ 列表接口给的 isAnimated）
     cells: new Map(),       // name -> cell element
     shown: '',              // 当前上屏文件名
     shownKey: '',
@@ -79,7 +81,7 @@ const isMobileLike = () => isTouch() && Math.min(window.innerWidth, window.inner
 const toast = {
     ok: (m) => toastr.success(m, '小帷'),
     err: (m) => toastr.error(m, '小帷'),
-    warn: (m) => toastr.warning(m, '小帷'),
+    warn: (m, o) => toastr.warning(m, '小帷', o),
     info: (m, o) => toastr.info(m, '小帷', o),
 };
 
@@ -172,9 +174,18 @@ async function sniffDims(blob) {
     const dv = new DataView(head.buffer);
     const n = head.length;
     if (n < 30) return null;
-    // PNG
+    // PNG（IDAT 之前出现 acTL 块就是 APNG）
     if (head[0] === 0x89 && head[1] === 0x50 && head[2] === 0x4E && head[3] === 0x47) {
-        return { w: dv.getUint32(16), h: dv.getUint32(20) };
+        let animated = false;
+        let i = 8;
+        while (i + 8 <= n) {
+            const len = dv.getUint32(i);
+            const type = String.fromCharCode(head[i + 4], head[i + 5], head[i + 6], head[i + 7]);
+            if (type === 'acTL') { animated = true; break; }
+            if (type === 'IDAT' || type === 'IEND') break;
+            i += 12 + len;
+        }
+        return { w: dv.getUint32(16), h: dv.getUint32(20), animated };
     }
     // GIF
     if (head[0] === 0x47 && head[1] === 0x49 && head[2] === 0x46) {
@@ -193,7 +204,8 @@ async function sniffDims(blob) {
             return { w: 1 + (((b1 & 0x3F) << 8) | b0), h: 1 + (((b3 & 0x0F) << 10) | (b2 << 2) | ((b1 & 0xC0) >> 6)) };
         }
         if (chunk === 'VP8X') {
-            return { w: 1 + (head[24] | (head[25] << 8) | (head[26] << 16)), h: 1 + (head[27] | (head[28] << 8) | (head[29] << 16)) };
+            // 标志位 bit1 = Animation
+            return { w: 1 + (head[24] | (head[25] << 8) | (head[26] << 16)), h: 1 + (head[27] | (head[28] << 8) | (head[29] << 16)), animated: !!(head[20] & 0x02) };
         }
         return null;
     }
@@ -315,7 +327,7 @@ function targetDims() {
 function layerKey(name) {
     const s = settings();
     const { tw, th } = targetDims();
-    return `${name}|${tw}x${th}|${s.fit}|${s.maxEdge}|${s.quality}`;
+    return `${name}|${tw}x${th}|${s.fit}|${s.maxEdge}|${s.quality}${state.animated.has(name) ? '|anim' : ''}`;
 }
 
 async function getScaledBlob(name) {
@@ -380,7 +392,7 @@ async function applyBackground(name, { force = false } = {}) {
             });
             if (seq !== state.seq) return;
             v.play().catch(() => {});
-        } else if (name && (!s.maxEdge || NO_SCALE_EXT.test(name))) {
+        } else if (name && (!s.maxEdge || NO_SCALE_EXT.test(name) || state.animated.has(name))) {
             const direct = bgUrl(name);
             await loadImg(direct);
             if (seq !== state.seq) return;
@@ -648,9 +660,11 @@ function sortedNames() {
 
 function resortGrid() {
     const grid = state.ui.grid;
-    const frag = document.createDocumentFragment();
-    for (const n of sortedNames()) frag.appendChild(state.cells.get(n));
-    grid.appendChild(frag);
+    // 只挪位置不对的格子：整体重新 append 会让 IntersectionObserver 把所有缩略图卸了再装一遍，每传一张闪一下
+    sortedNames().forEach((n, i) => {
+        const cell = state.cells.get(n);
+        if (grid.children[i] !== cell) grid.insertBefore(cell, grid.children[i] || null);
+    });
 }
 
 function applyFilter() {
@@ -692,14 +706,36 @@ function refreshBadges() {
     btn.querySelector('span').textContent = locked ? '已锁定本聊天' : '锁定到本聊天';
 }
 
-async function refreshList() {
+/**
+ * 解析原生 /api/backgrounds/all 的返回，三种格式都认：
+ *  - 1.13.0 及更早：["a.jpg", ...]
+ *  - 1.13.1 起：{ images: ["a.jpg", ...], config }
+ *  - 1.16 起：{ images: [{ filename, isAnimated }, ...], config }
+ * 认不出来就抛错，宁可报错也不要把列表当成空的（否则上传完一刷新，格子全没了）。
+ */
+function parseListResponse(data) {
+    const raw = Array.isArray(data) ? data : (Array.isArray(data?.images) ? data.images : null);
+    if (!raw) throw new Error('背景列表格式无法识别，可能酒馆版本太新或太旧');
+    const names = [];
+    const animated = new Set();
+    for (const it of raw) {
+        const name = typeof it === 'string' ? it : String((it && (it.filename || it.name || it.file)) || '');
+        if (!name || name.startsWith('__')) continue; // __transparent.png 是原生"无背景"的占位图
+        names.push(name);
+        if (it && typeof it === 'object' && it.isAnimated) animated.add(name);
+    }
+    return { names, animated };
+}
+
+async function fetchList() {
     const r = await fetch('/api/backgrounds/all', { method: 'POST', headers: ctx().getRequestHeaders(), body: '{}' });
     if (!r.ok) throw new Error(`获取背景列表失败 HTTP ${r.status}`);
-    const data = await r.json();
-    const names = (Array.isArray(data) ? data : [])
-        .map((it) => (typeof it === 'string' ? it : (it && (it.name || it.file || it.filename)) || ''))
-        .map(String)
-        .filter((n) => n && !n.startsWith('__'));
+    return parseListResponse(await r.json());
+}
+
+async function refreshList() {
+    const { names, animated } = await fetchList();
+    state.animated = animated;
     const set = new Set(names);
     for (const n of [...state.cells.keys()]) if (!set.has(n)) removeCell(n);
     for (const n of names) addCell(n);
@@ -708,6 +744,7 @@ async function refreshList() {
     applyFilter();
     refreshBadges();
     updateBatchBar();
+    return names;
 }
 
 /* ────────────────────────── 批量选择 ────────────────────────── */
@@ -773,6 +810,7 @@ async function deleteBackgrounds(names) {
             });
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             removeCell(n);
+            state.animated.delete(n);
             await purgeCache(n);
             const s = settings();
             if (s.current === n) { s.current = ''; saveSettings(); }
@@ -816,6 +854,7 @@ async function renameBackground(oldName) {
         state.cells.set(newName, cell);
     }
     if (state.selected.delete(oldName)) state.selected.add(newName);
+    if (state.animated.delete(oldName)) state.animated.add(newName);
     state.names = state.names.map((n) => (n === oldName ? newName : n));
     const s = settings();
     if (s.current === oldName) { s.current = newName; saveSettings(); }
@@ -827,12 +866,30 @@ async function renameBackground(oldName) {
     toast.ok('已重命名');
 }
 
+/**
+ * 酒馆的背景列表只收录图片（服务端按 MIME 过滤），视频文件传上去也不会出现在列表里。
+ * 跟原生上传一样：装了官方 Video Background Loader 扩展就转成动态 WebP，没装就提示并跳过。
+ */
+async function convertVideoForUpload(file) {
+    const convert = globalThis.convertVideoToAnimatedWebp;
+    if (typeof convert !== 'function') {
+        toast.warn(`「${file.name}」是视频，酒馆的背景列表只收录图片。装上官方 Video Background Loader 扩展后，小帷会在上传时自动转成动态 WebP。`, { timeOut: 12000 });
+        return null;
+    }
+    const buffer = await convert({ buffer: new Uint8Array(await file.arrayBuffer()), name: file.name });
+    return {
+        blob: new Blob([new Uint8Array(buffer)], { type: 'image/webp' }),
+        filename: file.name.replace(/\.[^.]+$/, '') + '.webp',
+    };
+}
+
 async function uploadFiles(files) {
     const list = Array.from(files || []).filter((f) => f && f.size > 0);
     if (!list.length) return;
     const s = settings();
     const total = list.length;
-    let done = 0, fail = 0;
+    let done = 0, fail = 0, skipped = 0;
+    const uploaded = [];
     const $progress = toast.info(`上传中 0/${total}`, { timeOut: 0, extendedTimeOut: 0, tapToDismiss: false });
     const setProgress = (t) => { try { $progress.find('.toast-message').text(t); } catch { /* ignore */ } };
     const q = new Queue(2);
@@ -841,11 +898,15 @@ async function uploadFiles(files) {
         try {
             let blob = file;
             let filename = file.name;
-            const compressible = file.type.startsWith('image/') && !NO_SCALE_EXT.test(file.name) && !/svg/i.test(file.type);
-            if (s.compressUpload && compressible) {
+            if (file.type.startsWith('video/') || VIDEO_EXT.test(file.name)) {
+                const converted = await convertVideoForUpload(file);
+                if (!converted) { skipped++; return; }
+                blob = converted.blob;
+                filename = converted.filename;
+            } else if (s.compressUpload && file.type.startsWith('image/') && !NO_SCALE_EXT.test(file.name) && !/svg/i.test(file.type)) {
                 const dims = await sniffDims(file).catch(() => null);
                 const big = file.size > 1.5 * 1024 * 1024 || (dims && Math.max(dims.w, dims.h) > s.uploadMaxEdge);
-                if (big) {
+                if (big && !dims?.animated) { // 动图压了就不动了，原样上传
                     blob = await rescale(file, { mode: 'fit', w: s.uploadMaxEdge, quality: s.uploadQuality });
                     filename = filename.replace(/\.[^.]+$/, '') + '.jpg';
                 }
@@ -866,17 +927,29 @@ async function uploadFiles(files) {
             unloadThumb(cell);
             cell._fails = 0;
             cell.classList.remove('is-error');
+            if (cell.dataset.want === '1') loadThumb(cell); // 同名覆盖且格子还在视口里：立刻换上新缩略图
+            uploaded.push(saved);
             done++;
         } catch (e) {
             fail++;
             console.error(TAG, '上传失败：', file.name, e);
+        } finally {
+            setProgress(`上传中 ${done + fail + skipped}/${total}`);
         }
-        setProgress(`上传中 ${done + fail}/${total}`);
     })));
 
     try { toastr.clear($progress); } catch { /* ignore */ }
-    try { await refreshList(); } catch (e) { console.warn(TAG, e); resortGrid(); applyFilter(); }
-    if (fail) toast.err(`上传完成：成功 ${done}，失败 ${fail}`); else toast.ok(`已上传 ${done} 张`);
+    let listed = null;
+    try { listed = new Set(await refreshList()); } catch (e) { console.warn(TAG, e); resortGrid(); applyFilter(); }
+    const missing = listed ? uploaded.filter((n) => !listed.has(n)) : [];
+    if (state.shown && uploaded.includes(state.shown)) await applyBackground(state.shown, { force: true });
+    if (missing.length) toast.warn(`已传到服务器，但酒馆的背景列表没有收录：${missing.join('、')}`, { timeOut: 12000 });
+    const parts = [`成功 ${done}`];
+    if (fail) parts.push(`失败 ${fail}`);
+    if (skipped) parts.push(`跳过 ${skipped}`);
+    if (fail) toast.err(`上传完成：${parts.join('，')}`);
+    else if (skipped) toast.warn(`上传完成：${parts.join('，')}`);
+    else toast.ok(`已上传 ${done} 张`);
 }
 
 /* ────────────────────────── 右键 / 更多菜单 ────────────────────────── */
@@ -1293,6 +1366,7 @@ jQuery(async () => {
 
         applyTakeover();
         await refreshList();
+        applyBackground(resolveName()); // 列表带回了动图标记，当前背景若是动图就改走直出
         console.log(TAG, '就绪，背景', state.cells.size, '张');
     } catch (e) {
         console.error(TAG, '初始化失败：', e);
