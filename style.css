@@ -1,0 +1,235 @@
+/* ───────── 小帷 · 背景轻管家 ───────── */
+
+/* 接管时：隐藏原生面板内容，关掉原生背景层与原生列表的贴图加载 */
+body.bglite-on #Backgrounds > *:not(#bglite_root) { display: none !important; }
+body.bglite-on #bg1,
+body.bglite-on #bg_custom { background-image: none !important; }
+body.bglite-on #bg_menu_content .bg_example,
+body.bglite-on #bg_custom_content .bg_example { background-image: none !important; }
+body:not(.bglite-on) #bglite_root { display: none !important; }
+
+/* 显示层 */
+#bglite_layer {
+    position: fixed;
+    inset: 0;
+    z-index: -1;
+    pointer-events: none;
+    overflow: hidden;
+}
+.bglite-bg {
+    position: absolute;
+    inset: 0;
+    background-repeat: no-repeat;
+    background-position: center center;
+    background-size: cover;
+    opacity: 0;
+    transition: opacity .35s ease;
+}
+.bglite-bg.on { opacity: 1; }
+body.bglite-nofade .bglite-bg { transition: none; }
+.bglite-bg.fit-contain { background-size: contain; }
+.bglite-bg.fit-center { background-size: auto; }
+.bglite-bg video {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+}
+
+/* 面板 */
+#bglite_root {
+    --bglite-cell: 120px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 4px 2px 14px;
+}
+.bglite-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+.bglite-bar .text_pole {
+    flex: 1 1 140px;
+    min-width: 120px;
+    margin: 0;
+}
+.bglite-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin: 0;
+    white-space: nowrap;
+    cursor: pointer;
+}
+.bglite-btn.active { box-shadow: inset 0 0 0 2px var(--SmartThemeQuoteColor); }
+.bglite-btn.spinning i { animation: bglite-spin .8s linear infinite; }
+@keyframes bglite-spin { to { transform: rotate(360deg); } }
+.bglite-count {
+    margin-left: auto;
+    opacity: .7;
+    font-size: .85em;
+    white-space: nowrap;
+}
+.bglite-batchbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    padding: 6px;
+    border: 1px dashed var(--SmartThemeBorderColor);
+    border-radius: 8px;
+}
+.bglite-danger { color: #ff6b6b; }
+
+/* 网格 */
+.bglite-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(var(--bglite-cell), 1fr));
+    gap: 8px;
+}
+.bglite-cell {
+    position: relative;
+    aspect-ratio: 16 / 10;
+    border-radius: 8px;
+    overflow: hidden;
+    background: rgba(127, 127, 127, .12);
+    border: 2px solid transparent;
+    cursor: pointer;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-touch-callout: none;
+    touch-action: pan-y;
+    content-visibility: auto;
+    contain-intrinsic-size: 0 90px;
+}
+.bglite-cell[hidden] { display: none; }
+.bglite-cell.is-current { border-color: var(--SmartThemeQuoteColor); }
+.bglite-cell.selected { outline: 2px solid var(--SmartThemeQuoteColor); outline-offset: -2px; }
+.bglite-cell.is-error .bglite-thumb::after {
+    content: '!';
+    position: absolute;
+    font-weight: bold;
+    opacity: .5;
+}
+.bglite-thumb {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.bglite-thumb img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    pointer-events: none;
+}
+.bglite-thumb .ph { opacity: .35; font-size: 1.6em; }
+.bglite-name {
+    position: absolute;
+    left: 0; right: 0; bottom: 0;
+    padding: 14px 6px 4px;
+    font-size: .72em;
+    line-height: 1.2;
+    color: #fff;
+    background: linear-gradient(transparent, rgba(0, 0, 0, .65));
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, .8);
+    pointer-events: none;
+}
+.bglite-badges {
+    position: absolute;
+    top: 5px; left: 6px;
+    display: flex;
+    gap: 4px;
+    font-size: .8em;
+    color: #fff;
+    text-shadow: 0 1px 2px #000;
+    pointer-events: none;
+}
+.bglite-more {
+    position: absolute;
+    top: 3px; right: 3px;
+    width: 26px; height: 26px;
+    padding: 0;
+    border: 0;
+    border-radius: 50%;
+    background: rgba(0, 0, 0, .45);
+    color: #fff;
+    font-size: 15px;
+    line-height: 26px;
+    text-align: center;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity .15s;
+}
+.bglite-cell:hover .bglite-more,
+.bglite-grid.touch .bglite-more { opacity: 1; }
+
+/* 批量模式 */
+.bglite-check {
+    position: absolute;
+    top: 6px; left: 6px;
+    width: 20px; height: 20px;
+    border-radius: 50%;
+    border: 2px solid #fff;
+    background: rgba(0, 0, 0, .35);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, .5);
+    display: none;
+}
+.bglite-grid.batch .bglite-check { display: block; }
+.bglite-grid.batch .bglite-badges { left: 32px; }
+.bglite-grid.batch .bglite-more { display: none; }
+.bglite-cell.selected .bglite-check {
+    background: var(--SmartThemeQuoteColor);
+    box-shadow: inset 0 0 0 3px rgba(0, 0, 0, .35);
+}
+
+/* 菜单 */
+.bglite-menu {
+    position: fixed;
+    z-index: 10000;
+    min-width: 170px;
+    padding: 4px;
+    border-radius: 10px;
+    background: var(--SmartThemeBlurTintColor);
+    border: 1px solid var(--SmartThemeBorderColor);
+    backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
+    -webkit-backdrop-filter: blur(var(--SmartThemeBlurStrength, 10px));
+    box-shadow: 0 6px 24px rgba(0, 0, 0, .35);
+}
+.bglite-menu > div {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 12px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: .9em;
+}
+.bglite-menu > div:hover { background: rgba(127, 127, 127, .2); }
+.bglite-menu > div > i { width: 1.1em; text-align: center; opacity: .8; }
+.bglite-menu .danger { color: #ff6b6b; }
+
+.bglite-empty { opacity: .6; text-align: center; padding: 24px 0; }
+
+/* 设置面板 */
+#bglite_settings .bglite-row {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin: 6px 0;
+}
+#bglite_settings .bglite-row > span:first-child { min-width: 7em; }
+#bglite_settings select,
+#bglite_settings input[type="number"] { max-width: 14em; }
+#bglite_settings input[type="range"] { flex: 1 1 120px; max-width: 220px; }
+#bglite_settings .bglite-val { opacity: .7; font-size: .85em; min-width: 2.5em; }
+#bglite_settings .bglite-usage { opacity: .7; font-size: .85em; }
+#bglite_settings small { display: block; margin-top: 6px; opacity: .7; line-height: 1.5; }

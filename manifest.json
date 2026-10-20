@@ -1,0 +1,12 @@
+{
+  "display_name": "小帷 · 背景轻管家",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "style.css",
+  "author": "江",
+  "version": "0.1.0",
+  "homePage": "",
+  "auto_update": false
+}
