@@ -7,6 +7,8 @@ body.bglite-on #bg_custom { background-image: none !important; }
 body.bglite-on #bg_menu_content .bg_example,
 body.bglite-on #bg_custom_content .bg_example { background-image: none !important; }
 body:not(.bglite-on) #bglite_root { display: none !important; }
+/* 面板里带 hidden 属性的元素一律不显示：自己写的 display: flex 会盖过浏览器默认的 [hidden] { display: none } */
+#bglite_root [hidden] { display: none !important; }
 
 /* 显示层 */
 #bglite_layer {
