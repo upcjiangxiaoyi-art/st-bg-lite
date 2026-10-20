@@ -15,6 +15,7 @@
  */
 
 const MODULE = 'bglite';
+const VERSION = '0.2.2';
 const TAG = '[小帷]';
 const META_KEY = 'bglite';                 // 0.1 版小帷自己记的锁定键，现在只用来迁移
 const NATIVE_META_KEY = 'custom_background'; // 原生按聊天锁定的键：酒馆、生图插件、/lockbg 共用的通道，小帷也只认它
@@ -379,8 +380,11 @@ function ensureLayer() {
     if (!wrap) {
         wrap = document.createElement('div');
         wrap.id = 'bglite_layer';
-        document.body.appendChild(wrap);
     }
+    // 挂进原生的 #bg1 里：原生背景能显示的地方小帷就能显示，层级、尺寸、主题对 #bg1 的处理全部继承，
+    // 不怕美化主题把 body 底下的东西盖住。找不到 #bg1 才退回挂在 body 上。
+    const host = document.getElementById('bg1') || document.body;
+    if (wrap.parentElement !== host) host.appendChild(wrap);
     wrap.replaceChildren();
     state.layerA = document.createElement('div');
     state.layerB = document.createElement('div');
@@ -540,16 +544,13 @@ function onChatChanged() {
 
 /**
  * 别的东西改了原生背景层（生图插件"设为聊天背景"、/lockbg、/unlockbg、原生面板…）：
- * 以聊天元数据为准重新上屏。要是塞进来的是背景库之外的图片而元数据里没记，也直接显示它。
+ * 以聊天元数据为准重新上屏。只认元数据，不认 #bg1 上贴的图——美化主题常常自己往 #bg1 上贴东西。
  */
 let nativeTimer = null;
 function onNativeLayerChanged() {
     clearTimeout(nativeTimer);
     nativeTimer = setTimeout(() => {
         if (!settings().enabled) return;
-        const lock = getChatLock();
-        const poked = normalizeSource(parseCssUrl(document.getElementById('bg1')?.style.backgroundImage));
-        if (!lock && poked && isUrlSource(poked)) { applyBackground(poked); return; }
         applyBackground(resolveName());
         refreshBadges();
     }, 80);
@@ -1543,8 +1544,64 @@ function registerSlash() {
             callback: async () => { await unlockChat(); return ''; },
             helpString: '解除本聊天的背景锁定。',
         }));
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'bglite-debug',
+            callback: async () => { await showDebug(); return ''; },
+            helpString: '显示小帷的显示层状态，排查"换了背景看不见"用。',
+        }));
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps({
+            name: 'bglite-probe',
+            callback: () => { probeLayer(); return ''; },
+            helpString: '把小帷的显示层闪成粉色 3 秒：看得到粉色说明显示层没被盖住。',
+        }));
     } catch (e) {
         console.warn(TAG, '注册斜杠命令失败：', e);
+    }
+}
+
+/* ────────────────────────── 排查 ────────────────────────── */
+
+/** 显示层闪成粉色 3 秒：看得到就是层没问题（那就是图的事），看不到就是被主题或别的东西盖住了 */
+function probeLayer() {
+    ensureLayer();
+    const wrap = document.getElementById('bglite_layer');
+    if (!wrap) return;
+    wrap.classList.add('bglite-probe');
+    toast.info('接下来 3 秒，背景的位置应该是一片粉色。看到了：显示层正常，是图片没加载上；没看到：显示层被主题或别的东西盖住了。', { timeOut: 7000 });
+    setTimeout(() => wrap.classList.remove('bglite-probe'), 3000);
+}
+
+/** 把显示层的情况汇总成一段文字弹出来，方便截图发来排查 */
+async function showDebug() {
+    const cs = (el, props) => (el ? props.map((p) => `${p}=${getComputedStyle(el)[p]}`).join(' ') : '(无)');
+    const rect = (el) => { if (!el) return '(无)'; const r = el.getBoundingClientRect(); return `${Math.round(r.width)}×${Math.round(r.height)} @${Math.round(r.left)},${Math.round(r.top)}`; };
+    const wrap = document.getElementById('bglite_layer');
+    const bg1 = document.getElementById('bg1');
+    const on = wrap?.querySelector('.bglite-bg.on');
+    const centre = document.elementFromPoint(Math.round(innerWidth / 2), Math.round(innerHeight / 2));
+    const chain = [];
+    for (let el = centre, i = 0; el && i < 4; el = el.parentElement, i++) chain.push(el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') + (el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\s+/).slice(0, 2).join('.') : ''));
+    const lines = [
+        `小帷 ${VERSION} · 酒馆 ${ctx().getVersion ? '' : ''}${navigator.userAgent}`,
+        `接管=${settings().enabled} 视口=${innerWidth}×${innerHeight} dpr=${devicePixelRatio} 屏幕=${screen.width}×${screen.height}`,
+        `当前上屏=${state.shown || '(空)'} key=${state.shownKey || '(空)'} 锁定=${getChatLock() || '(无)'} 全局=${settings().current || '(无)'}`,
+        `显示层挂在=${wrap?.parentElement ? (wrap.parentElement.id ? '#' + wrap.parentElement.id : wrap.parentElement.tagName) : '(未挂载)'} 尺寸=${rect(wrap)} ${cs(wrap, ['display', 'visibility', 'opacity', 'zIndex', 'position'])}`,
+        `亮着的那层: ${on ? `${rect(on)} opacity=${getComputedStyle(on).opacity} 图=${(on.style.backgroundImage || '(无)').slice(0, 60)} 视频=${!!on.querySelector('video')}` : '(没有)'}`,
+        `#bg1: ${rect(bg1)} ${cs(bg1, ['display', 'visibility', 'opacity', 'zIndex', 'position'])} 原生图=${bg1 ? getComputedStyle(bg1).backgroundImage.slice(0, 50) : '(无)'}`,
+        `body: ${cs(document.body, ['backgroundColor', 'backgroundImage'])} html: ${cs(document.documentElement, ['backgroundColor', 'backgroundImage', 'transform'])}`,
+        `屏幕正中最上层的元素: ${chain.join(' < ') || '(无)'}`,
+        `缓存: thumbs=${(await idbKeys('thumbs') || []).length} scaled=${(await idbKeys('scaled') || []).length}`,
+    ];
+    const text = lines.join('\n');
+    console.log(TAG, '排查信息\n' + text);
+    const c = ctx();
+    if (c.callGenericPopup && c.POPUP_TYPE) {
+        const pre = document.createElement('pre');
+        pre.style.cssText = 'white-space:pre-wrap;word-break:break-all;text-align:left;font-size:.8em;user-select:text;-webkit-user-select:text';
+        pre.textContent = text;
+        await c.callGenericPopup(pre, c.POPUP_TYPE.TEXT, '', { okButton: '关闭', wide: true, large: true, allowVerticalScrolling: true });
+    } else {
+        alert(text);
     }
 }
 

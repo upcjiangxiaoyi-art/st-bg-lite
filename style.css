@@ -10,13 +10,24 @@ body:not(.bglite-on) #bglite_root { display: none !important; }
 /* 面板里带 hidden 属性的元素一律不显示：自己写的 display: flex 会盖过浏览器默认的 [hidden] { display: none } */
 #bglite_root [hidden] { display: none !important; }
 
-/* 显示层 */
+/* 显示层：正常情况挂在原生 #bg1 里面，跟着它的层级和尺寸走；找不到 #bg1 才挂 body 上 */
 #bglite_layer {
     position: fixed;
     inset: 0;
     z-index: -1;
     pointer-events: none;
     overflow: hidden;
+}
+#bg1 > #bglite_layer {
+    position: absolute;
+    z-index: auto;
+}
+/* /bglite-probe：闪一片粉色，验证显示层有没有被盖住 */
+#bglite_layer.bglite-probe::after {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: #ff2d95;
 }
 .bglite-bg {
     position: absolute;
