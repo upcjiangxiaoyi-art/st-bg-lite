@@ -8,6 +8,8 @@
  *  3. 上传 / 删除 / 重命名走酒馆原生接口，列表增量更新，不整体重绘。
  *     列表接口 /api/backgrounds/all 在酒馆 1.13.1 从数组改成了 { images, config }，1.16 起 images 里还带 isAnimated；三种格式都认。
  *  4. 原生面板与原生背景层通过 CSS 关闭贴图加载；关掉扩展开关即可恢复原生。
+ *  5. 可按名称或加入时间排序；新加的背景带 NEW 标，点一下消失。加入时间优先用酒馆 1.15+ 记录的
+ *     addedTimestamp（/api/image-metadata/all），老版本用本机第一次见到它的时间。
  *
  * 依赖：SillyTavern 1.12+（使用 SillyTavern.getContext()）。
  */
@@ -34,12 +36,18 @@ const DEFAULTS = Object.freeze({
     uploadMaxEdge: 2560,
     uploadQuality: 0.9,
     syncNative: false,      // 选择时同步调用原生 /bg（兼容用）
-    sortDesc: false,
+    sort: 'name-asc',       // name-asc | name-desc | time-desc | time-asc
+    newSince: 0,            // 这个时间之后加入的背景算"新"；第一次运行时设为当时，已有的都算旧
+    seenNew: [],            // 点过的新背景（点一下 NEW 就消失）；"全部已看"会清空并把 newSince 推到现在
 });
 
 const state = {
     names: [],
     animated: new Set(),    // 服务端标记为动图的文件名（酒馆 1.16+ 列表接口给的 isAnimated）
+    times: new Map(),       // name -> 加入时间（毫秒）；排序和 NEW 标都用它
+    newSet: new Set(),      // 当前带 NEW 标的文件名
+    onlyNew: false,         // "只看新的"筛选
+    noServerTimes: false,   // 服务端没有 image-metadata 接口（老酒馆），别每次都去撞 404
     cells: new Map(),       // name -> cell element
     shown: '',              // 当前上屏文件名
     shownKey: '',
@@ -64,7 +72,8 @@ function settings() {
     const all = ctx().extensionSettings;
     if (!all[MODULE] || typeof all[MODULE] !== 'object') all[MODULE] = {};
     const s = all[MODULE];
-    for (const [k, v] of Object.entries(DEFAULTS)) if (!(k in s)) s[k] = v;
+    if (typeof s.sort !== 'string' && typeof s.sortDesc === 'boolean') { s.sort = s.sortDesc ? 'name-desc' : 'name-asc'; delete s.sortDesc; } // 旧版只有正反序
+    for (const [k, v] of Object.entries(DEFAULTS)) if (!(k in s)) s[k] = Array.isArray(v) ? [...v] : v;
     return s;
 }
 const saveSettings = () => ctx().saveSettingsDebounced();
@@ -117,11 +126,12 @@ function openDb() {
     if (dbPromise) return dbPromise;
     dbPromise = new Promise((resolve, reject) => {
         try {
-            const req = indexedDB.open(DB_NAME, 1);
+            const req = indexedDB.open(DB_NAME, 2);
             req.onupgradeneeded = () => {
                 const db = req.result;
                 if (!db.objectStoreNames.contains('thumbs')) db.createObjectStore('thumbs');
                 if (!db.objectStoreNames.contains('scaled')) db.createObjectStore('scaled');
+                if (!db.objectStoreNames.contains('seen')) db.createObjectStore('seen'); // 本机第一次见到各背景的时间
             };
             req.onsuccess = () => resolve(req.result);
             req.onerror = () => reject(req.error);
@@ -457,6 +467,7 @@ const resolveName = () => getChatLock() || settings().current || '';
 
 async function selectBackground(name) {
     const s = settings();
+    markSeen(name);
     if (hasChat() && getChatLock()) await setChatLock(name);
     else { s.current = name; saveSettings(); }
     await applyBackground(name);
@@ -654,8 +665,17 @@ function removeCell(name) {
 }
 
 function sortedNames() {
-    const arr = [...state.cells.keys()].sort(naturalCompare);
-    return settings().sortDesc ? arr.reverse() : arr;
+    const sort = settings().sort;
+    const arr = [...state.cells.keys()];
+    if (sort === 'time-desc' || sort === 'time-asc') {
+        const dir = sort === 'time-asc' ? 1 : -1;
+        const t = (n) => state.times.get(n) || 0;
+        arr.sort((a, b) => dir * (t(a) - t(b)) || naturalCompare(a, b));
+    } else {
+        const dir = sort === 'name-desc' ? -1 : 1;
+        arr.sort((a, b) => dir * naturalCompare(a, b));
+    }
+    return arr;
 }
 
 function resortGrid() {
@@ -671,11 +691,14 @@ function applyFilter() {
     const q = state.filter.trim().toLowerCase();
     let shown = 0;
     for (const [n, cell] of state.cells) {
-        const hit = !q || n.toLowerCase().includes(q);
+        const hit = (!q || n.toLowerCase().includes(q)) && (!state.onlyNew || state.newSet.has(n));
         cell.hidden = !hit;
         if (hit) shown++;
     }
-    state.ui.empty.hidden = state.cells.size > 0;
+    const empty = state.ui.empty;
+    if (!state.cells.size) { empty.textContent = '还没有背景，点「上传」添加。'; empty.hidden = false; }
+    else if (state.onlyNew && !shown) { empty.textContent = '没有新加的背景。'; empty.hidden = false; }
+    else empty.hidden = true;
     updateCount(shown);
 }
 
@@ -692,6 +715,12 @@ function refreshBadges() {
         cell.classList.toggle('is-current', n === state.shown && !!n);
         const badges = cell.querySelector('.bglite-badges');
         badges.replaceChildren();
+        if (state.newSet.has(n)) {
+            const tag = document.createElement('span');
+            tag.className = 'bglite-newtag';
+            tag.textContent = 'NEW';
+            badges.appendChild(tag);
+        }
         if (n === lock) {
             const i = document.createElement('i');
             i.className = 'fa-solid fa-lock';
@@ -740,11 +769,106 @@ async function refreshList() {
     for (const n of [...state.cells.keys()]) if (!set.has(n)) removeCell(n);
     for (const n of names) addCell(n);
     state.names = names;
+    await loadTimes(names);
+    computeNew();
     resortGrid();
     applyFilter();
     refreshBadges();
     updateBatchBar();
+    const s = settings();
+    if (s.current && !set.has(s.current)) { s.current = ''; saveSettings(); } // 当前背景在别处被删了，别每次开页都报错
+    if (state.shown && !set.has(state.shown)) applyBackground(resolveName());
     return names;
+}
+
+/* ────────────────────────── 加入时间 / NEW 标 ────────────────────────── */
+
+/** 服务端记录的加入时间（酒馆 1.15+ 的 image-metadata 接口）；老酒馆没有这个接口，返回 null */
+async function fetchServerTimes() {
+    if (state.noServerTimes) return null;
+    const r = await fetch('/api/image-metadata/all', { method: 'POST', headers: ctx().getRequestHeaders(), body: JSON.stringify({ prefix: 'backgrounds/' }) });
+    if (r.status === 404) { state.noServerTimes = true; return null; }
+    if (!r.ok) return null;
+    const data = await r.json();
+    const map = new Map();
+    for (const [p, m] of Object.entries(data?.images || {})) {
+        const ts = Number(m?.addedTimestamp) || 0;
+        if (ts && p.startsWith('backgrounds/')) map.set(p.slice('backgrounds/'.length), ts);
+    }
+    return map;
+}
+
+/**
+ * 每个背景的"加入时间"：优先用服务端记录；没有的用本机第一次见到它的时间（存 IndexedDB）。
+ * 本机档案第一次建立时，把当时已有的全部记成 0（当旧的），之后新出现的才记当前时间。
+ */
+async function loadTimes(names) {
+    const server = await fetchServerTimes().catch((e) => { console.warn(TAG, '读取加入时间失败：', e?.message || e); return null; });
+    const rec = await idbGet('seen', 'firstSeen');
+    const first = rec && typeof rec === 'object' ? rec : null;
+    const now = Date.now();
+    const next = {};
+    let changed = !first || Object.keys(first).length !== names.length;
+    for (const n of names) {
+        if (first && typeof first[n] === 'number') next[n] = first[n];
+        else { next[n] = first ? now : 0; changed = true; }
+    }
+    if (changed) idbPut('seen', 'firstSeen', next);
+    state.times = new Map(names.map((n) => [n, (server && server.get(n)) || next[n] || 0]));
+}
+
+/** 算出哪些是新的：加入时间晚于 newSince、而且还没点过 */
+function computeNew() {
+    const s = settings();
+    if (!s.newSince) { s.newSince = Date.now(); saveSettings(); } // 第一次用：现有的都算旧，之后加的才算新
+    const seen = new Set(Array.isArray(s.seenNew) ? s.seenNew : []);
+    state.newSet = new Set();
+    for (const n of state.cells.keys()) {
+        if ((state.times.get(n) || 0) > s.newSince && !seen.has(n)) state.newSet.add(n);
+    }
+    // 修剪"点过"名单：文件没了、或本来就不算新的，不用再记
+    const kept = [...seen].filter((n) => state.cells.has(n) && (state.times.get(n) || 0) > s.newSince);
+    if (kept.length !== seen.size) { s.seenNew = kept; saveSettings(); }
+    updateNewUi();
+}
+
+function markSeen(name) {
+    if (!state.newSet.has(name)) return;
+    const s = settings();
+    const list = Array.isArray(s.seenNew) ? s.seenNew : [];
+    if (!list.includes(name)) { s.seenNew = [...list, name]; saveSettings(); }
+    state.newSet.delete(name);
+    updateNewUi();
+}
+
+function markAllSeen() {
+    const s = settings();
+    let since = Date.now();
+    for (const t of state.times.values()) if (t > since) since = t; // 服务器时钟比本机快也兜住
+    s.newSince = since;
+    s.seenNew = [];
+    saveSettings();
+    computeNew();
+}
+
+async function renameTime(oldName, newName) {
+    if (state.times.has(oldName)) { state.times.set(newName, state.times.get(oldName)); state.times.delete(oldName); }
+    if (state.newSet.delete(oldName)) state.newSet.add(newName);
+    const s = settings();
+    if (Array.isArray(s.seenNew) && s.seenNew.includes(oldName)) { s.seenNew = s.seenNew.map((n) => (n === oldName ? newName : n)); saveSettings(); }
+    const rec = await idbGet('seen', 'firstSeen');
+    if (rec && typeof rec === 'object' && oldName in rec) { rec[newName] = rec[oldName]; delete rec[oldName]; await idbPut('seen', 'firstSeen', rec); }
+}
+
+function updateNewUi() {
+    if (!state.ui) return;
+    const n = state.newSet.size;
+    if (!n && state.onlyNew) { state.onlyNew = false; state.ui.newBtn.classList.remove('active'); } // 看完了就退出筛选
+    state.ui.newCount.textContent = String(n);
+    state.ui.newBtn.hidden = !n;
+    state.ui.seenAll.hidden = !state.onlyNew;
+    refreshBadges();
+    applyFilter();
 }
 
 /* ────────────────────────── 批量选择 ────────────────────────── */
@@ -811,6 +935,8 @@ async function deleteBackgrounds(names) {
             if (!r.ok) throw new Error(`HTTP ${r.status}`);
             removeCell(n);
             state.animated.delete(n);
+            state.times.delete(n);
+            state.newSet.delete(n);
             await purgeCache(n);
             const s = settings();
             if (s.current === n) { s.current = ''; saveSettings(); }
@@ -823,7 +949,7 @@ async function deleteBackgrounds(names) {
         }
     }
     state.names = state.names.filter((n) => state.cells.has(n));
-    applyFilter();
+    updateNewUi();
     updateBatchBar();
     if (fail) toast.err(`删除完成：成功 ${ok}，失败 ${fail}`); else toast.ok(`已删除 ${ok} 张`);
 }
@@ -844,6 +970,7 @@ async function renameBackground(oldName) {
     if (!r.ok) { toast.err(`重命名失败 HTTP ${r.status}`); return; }
 
     await migrateCache(oldName, newName);
+    await renameTime(oldName, newName);
     const cell = state.cells.get(oldName);
     if (cell) {
         state.cells.delete(oldName);
@@ -997,7 +1124,12 @@ function openMenu(cell, x, y) {
 const PANEL_HTML = `
 <div class="bglite-bar">
   <input type="search" class="text_pole bglite-filter" placeholder="搜索文件名…" autocomplete="off">
-  <div class="menu_button bglite-btn" data-act="sort" title="排序"><i class="fa-solid fa-arrow-down-a-z"></i></div>
+  <select class="text_pole bglite-sort" title="排序">
+    <option value="name-asc">名称 A→Z</option>
+    <option value="name-desc">名称 Z→A</option>
+    <option value="time-desc">最新在前</option>
+    <option value="time-asc">最旧在前</option>
+  </select>
   <div class="menu_button bglite-btn" data-act="refresh" title="刷新列表"><i class="fa-solid fa-rotate"></i></div>
 </div>
 <div class="bglite-bar">
@@ -1005,6 +1137,8 @@ const PANEL_HTML = `
   <div class="menu_button bglite-btn" data-act="batch" title="批量选择（长按格子也可以）"><i class="fa-regular fa-square-check"></i><span>批量</span></div>
   <div class="menu_button bglite-btn bglite-lock" data-act="lock"><i class="fa-solid fa-lock-open"></i><span>锁定到本聊天</span></div>
   <div class="menu_button bglite-btn" data-act="clear" title="不使用背景"><i class="fa-solid fa-eraser"></i><span>无背景</span></div>
+  <div class="menu_button bglite-btn bglite-newbtn" data-act="onlynew" title="只看新加的背景（点一下格子 NEW 就消失）" hidden><i class="fa-solid fa-star"></i><span>新 <b class="bglite-newcount">0</b></span></div>
+  <div class="menu_button bglite-btn" data-act="seenall" title="把现在这些全部标为已看" hidden><i class="fa-solid fa-check-double"></i><span>全部已看</span></div>
   <span class="bglite-count"></span>
 </div>
 <div class="bglite-batchbar" hidden>
@@ -1038,6 +1172,10 @@ function mountPanel() {
         lockBtn: root.querySelector('.bglite-lock'),
         selCount: root.querySelector('.bglite-selcount'),
         file: root.querySelector('.bglite-file'),
+        sort: root.querySelector('.bglite-sort'),
+        newBtn: root.querySelector('[data-act="onlynew"]'),
+        newCount: root.querySelector('.bglite-newcount'),
+        seenAll: root.querySelector('[data-act="seenall"]'),
     };
     root.style.setProperty('--bglite-cell', `${settings().cellMin}px`);
     if (isTouch()) ui.grid.classList.add('touch');
@@ -1057,13 +1195,15 @@ function mountPanel() {
         const act = btn.dataset.act;
         try {
             switch (act) {
-                case 'sort': {
-                    const s = settings();
-                    s.sortDesc = !s.sortDesc; saveSettings();
-                    btn.querySelector('i').className = s.sortDesc ? 'fa-solid fa-arrow-up-z-a' : 'fa-solid fa-arrow-down-a-z';
-                    resortGrid();
+                case 'onlynew':
+                    state.onlyNew = !state.onlyNew;
+                    btn.classList.toggle('active', state.onlyNew);
+                    updateNewUi();
                     break;
-                }
+                case 'seenall':
+                    markAllSeen();
+                    toast.ok('已全部标为已看');
+                    break;
                 case 'refresh':
                     btn.classList.add('spinning');
                     await refreshList().catch((err) => toast.err(err.message));
@@ -1094,7 +1234,9 @@ function mountPanel() {
         ui.file.value = '';
         await uploadFiles(files);
     });
-    root.querySelector('[data-act="sort"] i').className = settings().sortDesc ? 'fa-solid fa-arrow-up-z-a' : 'fa-solid fa-arrow-down-a-z';
+    ui.sort.value = settings().sort;
+    if (ui.sort.value !== settings().sort) { ui.sort.value = 'name-asc'; settings().sort = 'name-asc'; }
+    ui.sort.addEventListener('change', () => { settings().sort = ui.sort.value; saveSettings(); resortGrid(); });
 
     // 格子：点击 / 更多 / 右键 / 长按
     let suppressClick = false;
