@@ -16,8 +16,8 @@
 
 const MODULE = 'bglite';
 const TAG = '[小帷]';
-const META_KEY = 'bglite';                 // chat_metadata 键：本聊天锁定的背景文件名
-const NATIVE_META_KEY = 'custom_background'; // 原生按聊天锁定的键（只读导入 + 解锁时一并清掉）
+const META_KEY = 'bglite';                 // 0.1 版小帷自己记的锁定键，现在只用来迁移
+const NATIVE_META_KEY = 'custom_background'; // 原生按聊天锁定的键：酒馆、生图插件、/lockbg 共用的通道，小帷也只认它
 const VIDEO_EXT = /\.(mp4|webm|mov|m4v)$/i;
 const NO_SCALE_EXT = /\.(gif|apng)$/i;      // 动图不缩放，直接用原文件
 const THUMB_PASSTHROUGH_BYTES = 200 * 1024;  // 服务端缩略图小于此体积就直接用
@@ -80,6 +80,25 @@ const saveSettings = () => ctx().saveSettingsDebounced();
 
 const isVideo = (n) => VIDEO_EXT.test(n);
 const bgUrl = (n) => `/backgrounds/${encodeURIComponent(n)}`;
+// 背景来源：没有斜杠的是背景库文件名，带斜杠的是图片地址（原生聊天背景通道会塞进来生图插件的图等）
+const isUrlSource = (n) => n.includes('/');
+const srcUrl = (n) => (isUrlSource(n) ? n : bgUrl(n));
+/** 把 CSS 的 url("...") 剥成路径 */
+function parseCssUrl(v) {
+    if (typeof v !== 'string') return '';
+    const s = v.trim();
+    const m = s.match(/^url\(\s*(['"]?)(.*?)\1\s*\)$/i);
+    return (m ? m[2] : s).trim();
+}
+/** 原生存的背景路径 → 小帷的来源：backgrounds/xxx 还原成文件名，其他路径原样当地址用 */
+function normalizeSource(p) {
+    if (!p || p === 'none') return '';
+    const m = p.match(/^\/?backgrounds\/(.+)$/);
+    if (m) { try { return decodeURIComponent(m[1]); } catch { return m[1]; } }
+    return p;
+}
+/** 小帷的来源 → 原生元数据里的写法（和原生 generateUrlParameter 一致） */
+const toNativeLock = (n) => (isUrlSource(n) ? `url("${n}")` : `url("backgrounds/${encodeURIComponent(n)}")`);
 const thumbUrl = (n) => `/thumbnail?type=bg&file=${encodeURIComponent(n)}`;
 const displayName = (n) => n.replace(/\.[^.]+$/, '');
 const naturalCompare = (a, b) => a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' });
@@ -346,7 +365,7 @@ async function getScaledBlob(name) {
     const cached = await idbGet('scaled', key);
     if (cached instanceof Blob) return cached;
     const { tw, th } = targetDims();
-    const src = await fetchBlob(bgUrl(name));
+    const src = await fetchBlob(srcUrl(name));
     const out = s.fit === 'cover'
         ? await rescale(src, { mode: 'cover', w: tw, h: th, quality: s.quality })
         : await rescale(src, { mode: 'fit', w: Math.max(tw, th), quality: s.quality });
@@ -377,6 +396,7 @@ async function applyBackground(name, { force = false } = {}) {
     ensureLayer();
     const s = settings();
     name = name || '';
+    if (name.startsWith('__')) name = ''; // __transparent.png 是原生的"无背景"占位，按清空处理
     const key = name ? layerKey(name) : '';
     if (!force && key === state.shownKey) { refreshBadges(); return; }
 
@@ -393,7 +413,7 @@ async function applyBackground(name, { force = false } = {}) {
             const v = document.createElement('video');
             v.muted = true; v.loop = true; v.autoplay = true; v.playsInline = true;
             v.setAttribute('playsinline', ''); v.setAttribute('muted', '');
-            v.src = bgUrl(name);
+            v.src = srcUrl(name);
             next.appendChild(v);
             await new Promise((resolve) => {
                 const t = setTimeout(resolve, 4000);
@@ -403,7 +423,7 @@ async function applyBackground(name, { force = false } = {}) {
             if (seq !== state.seq) return;
             v.play().catch(() => {});
         } else if (name && (!s.maxEdge || NO_SCALE_EXT.test(name) || state.animated.has(name))) {
-            const direct = bgUrl(name);
+            const direct = srcUrl(name);
             await loadImg(direct);
             if (seq !== state.seq) return;
             next.style.backgroundImage = `url("${direct}")`;
@@ -445,21 +465,31 @@ async function applyBackground(name, { force = false } = {}) {
 const chatMeta = () => ctx().chatMetadata || {};
 const hasChat = () => { try { return !!ctx().getCurrentChatId(); } catch { return false; } };
 
+/**
+ * 本聊天锁定的背景：只认原生的 custom_background，它是酒馆、生图插件（"设为聊天背景"）、/lockbg、/unlockbg
+ * 共用的通道，别的东西改了小帷也能跟上。返回文件名或图片地址，空串表示没锁。
+ * 0.1 版小帷把锁记在自己的键里，这里顺手迁到原生键上并删掉旧键（不然原生 /unlockbg 解不掉它）。
+ */
 function getChatLock() {
     const m = chatMeta();
-    if (typeof m[META_KEY] === 'string' && m[META_KEY]) return m[META_KEY];
-    const nat = m[NATIVE_META_KEY];
-    if (typeof nat === 'string') {
-        const mm = nat.match(/backgrounds\/([^"')]+)/);
-        if (mm) { try { return decodeURIComponent(mm[1]); } catch { return mm[1]; } }
+    const nat = normalizeSource(parseCssUrl(m[NATIVE_META_KEY]));
+    if (nat) return nat;
+    const legacy = typeof m[META_KEY] === 'string' ? m[META_KEY] : '';
+    if (legacy) {
+        delete m[META_KEY];
+        m[NATIVE_META_KEY] = toNativeLock(legacy);
+        try { ctx().saveMetadataDebounced?.(); } catch { /* ignore */ }
+        return legacy;
     }
     return '';
 }
 
+/** 写原生的键：关掉小帷、或别的插件来读，看到的都是同一个 */
 async function setChatLock(name) {
     const m = chatMeta();
-    if (name) m[META_KEY] = name;
-    else { delete m[META_KEY]; delete m[NATIVE_META_KEY]; }
+    delete m[META_KEY];
+    if (name) m[NATIVE_META_KEY] = toNativeLock(name);
+    else delete m[NATIVE_META_KEY];
     try { await ctx().saveMetadata(); } catch (e) { console.warn(TAG, '保存聊天元数据失败', e); }
 }
 
@@ -506,6 +536,38 @@ function onChatChanged() {
     if (!settings().enabled) return;
     applyBackground(resolveName());
     refreshBadges();
+}
+
+/**
+ * 别的东西改了原生背景层（生图插件"设为聊天背景"、/lockbg、/unlockbg、原生面板…）：
+ * 以聊天元数据为准重新上屏。要是塞进来的是背景库之外的图片而元数据里没记，也直接显示它。
+ */
+let nativeTimer = null;
+function onNativeLayerChanged() {
+    clearTimeout(nativeTimer);
+    nativeTimer = setTimeout(() => {
+        if (!settings().enabled) return;
+        const lock = getChatLock();
+        const poked = normalizeSource(parseCssUrl(document.getElementById('bg1')?.style.backgroundImage));
+        if (!lock && poked && isUrlSource(poked)) { applyBackground(poked); return; }
+        applyBackground(resolveName());
+        refreshBadges();
+    }, 80);
+}
+
+function watchNativeLayer() {
+    const c = ctx();
+    if (c.eventTypes.FORCE_SET_BACKGROUND) c.eventSource.on(c.eventTypes.FORCE_SET_BACKGROUND, onNativeLayerChanged);
+    const bg1 = document.getElementById('bg1');
+    if (bg1 && typeof MutationObserver === 'function') {
+        new MutationObserver(onNativeLayerChanged).observe(bg1, { attributes: true, attributeFilter: ['style'] });
+    }
+    // 兜底：有的改法既不动 #bg1 也没有事件（比如 /lockbg 锁的恰好是原生正在显示的那张），只有元数据变了
+    let lastRaw = chatMeta()[NATIVE_META_KEY];
+    setInterval(() => {
+        const raw = chatMeta()[NATIVE_META_KEY];
+        if (raw !== lastRaw) { lastRaw = raw; onNativeLayerChanged(); }
+    }, 1000);
 }
 
 /* ────────────────────────── 缩略图加载 ────────────────────────── */
@@ -733,6 +795,7 @@ function refreshBadges() {
     btn.classList.toggle('active', locked);
     btn.querySelector('i').className = locked ? 'fa-solid fa-lock' : 'fa-solid fa-lock-open';
     btn.querySelector('span').textContent = locked ? '已锁定本聊天' : '锁定到本聊天';
+    btn.title = locked && isUrlSource(lock) ? `本聊天锁定的是库外图片：${lock}` : '';
 }
 
 /**
@@ -1505,6 +1568,7 @@ jQuery(async () => {
 
         const c = ctx();
         c.eventSource.on(c.eventTypes.CHAT_CHANGED, onChatChanged);
+        watchNativeLayer();
         if (c.eventTypes.APP_READY) c.eventSource.on(c.eventTypes.APP_READY, () => applyTakeover());
         window.addEventListener('resize', onViewportChanged);
         if (screen.orientation?.addEventListener) screen.orientation.addEventListener('change', onViewportChanged);
