@@ -974,6 +974,9 @@ function openMenu(cell, x, y) {
     ];
     menuEl = document.createElement('div');
     menuEl.className = 'bglite-menu';
+    // 菜单挂在 body 上、不在抽屉里。酒馆会把抽屉外的 touchstart / mousedown 当成"点了外面"把抽屉收起来，
+    // 手机上点一下「删除」抽屉就没了，确认完还得重新打开。拦住这两个事件，别让它冒泡到酒馆那里。
+    for (const type of ['touchstart', 'mousedown']) menuEl.addEventListener(type, (e) => e.stopPropagation());
     for (const [icon, label, fn, cls] of items) {
         const it = document.createElement('div');
         it.className = cls || '';
